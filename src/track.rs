@@ -87,6 +87,22 @@ impl Track {
         Track { id }
     }
 
+    /// Returns the alternative track ids for this track, if any.
+    ///
+    /// Spotify exposes regional re-releases of the same recording as
+    /// "alternatives". When the primary track is unavailable for the current
+    /// account (region/catalogue restrictions), one of these alternatives is
+    /// usually playable instead.
+    pub async fn alternatives(&self, session: &Session) -> Vec<SpotifyId> {
+        match librespot::metadata::Track::get(session, &self.id).await {
+            Ok(track) => track.alternatives.0,
+            Err(e) => {
+                tracing::warn!("Failed to fetch alternatives for {:?}: {:?}", self.id, e);
+                Vec::new()
+            }
+        }
+    }
+
     pub async fn metadata(&self, session: &Session) -> Result<TrackMetadata> {
         let metadata = librespot::metadata::Track::get(session, &self.id)
             .await
