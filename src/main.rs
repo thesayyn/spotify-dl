@@ -42,6 +42,13 @@ struct Opt {
         help = "Force download even if the file already exists"
     )]
     force: bool,
+    #[structopt(
+        short = "r",
+        long = "retries",
+        help = "Number of times to retry a failed track before giving up. Default is 3.",
+        default_value = "3"
+    )]
+    retries: u32,
 }
 
 pub fn create_destination_if_required(destination: Option<String>) -> anyhow::Result<()> {
@@ -74,7 +81,13 @@ async fn main() -> anyhow::Result<()> {
     downloader
         .download_tracks(
             track,
-            &DownloadOptions::new(opt.destination, opt.parallel, opt.format, opt.force),
+            &DownloadOptions::new(
+                opt.destination,
+                opt.parallel,
+                opt.format,
+                opt.force,
+                opt.retries,
+            ),
         )
         .await
 }

@@ -31,10 +31,17 @@ pub struct DownloadOptions {
     pub parallel: usize,
     pub format: Format,
     pub force: bool,
+    pub retries: u32,
 }
 
 impl DownloadOptions {
-    pub fn new(destination: Option<String>, parallel: usize, format: Format, force: bool) -> Self {
+    pub fn new(
+        destination: Option<String>,
+        parallel: usize,
+        format: Format,
+        force: bool,
+        retries: u32,
+    ) -> Self {
         let destination =
             destination.map_or_else(|| std::env::current_dir().unwrap(), PathBuf::from);
         DownloadOptions {
@@ -42,6 +49,7 @@ impl DownloadOptions {
             parallel,
             format,
             force,
+            retries,
         }
     }
 }
@@ -70,7 +78,7 @@ impl Downloader {
 
     #[tracing::instrument(name = "download_track", skip(self))]
     async fn download_track(&self, track: Track, options: &DownloadOptions) -> Result<()> {
-        let metadata = match self.fetch_metadata(&track).await {
+        let metadata = match self.fetch_metadata(&track, options.retries).await {
             Ok(metadata) => metadata,
             Err(e) => {
                 // A failed metadata fetch (transient network error or rate
@@ -104,7 +112,7 @@ impl Downloader {
 
         let pb = self.add_progress_bar(&metadata);
 
-        let stream = Stream::new(self.session.clone());
+        let stream = Stream::new(self.session.clone(), options.retries);
         let channel = match stream.stream(track).await {
             Ok(channel) => channel,
             Err(e) => {
@@ -146,18 +154,19 @@ impl Downloader {
     /// errors or rate limiting (HTTP 429). librespot already sleeps on short
     /// `Retry-After` windows internally; this adds an outer backoff for longer
     /// throttling so a single hiccup doesn't fail the track.
-    async fn fetch_metadata(&self, track: &Track) -> Result<TrackMetadata> {
+    async fn fetch_metadata(&self, track: &Track, retries: u32) -> Result<TrackMetadata> {
         let track_id = format!("{:?}", track.id);
         tryhard::retry_fn(|| track.metadata(&self.session))
-            .retries(3)
+            .retries(retries)
             .on_retry(|attempt, _, e| {
                 let error = format!("{}", e);
                 let track_id = track_id.clone();
                 async move {
                     tracing::warn!(
-                        "Retrying metadata fetch for {} (attempt {} of 3): {}",
+                        "Retrying metadata fetch for {} (attempt {} of {}): {}",
                         track_id,
                         attempt,
+                        retries,
                         error
                     );
                 }

@@ -16,10 +16,11 @@ use crate::track::Track;
 pub struct Stream {
     player_config: PlayerConfig,
     session: Session,
+    retries: u32,
 }
 
 impl Stream {
-    pub fn new(session: Session) -> Self {
+    pub fn new(session: Session, retries: u32) -> Self {
         let config = PlayerConfig {
             bitrate: Bitrate::Bitrate320,
             ..Default::default()
@@ -27,6 +28,7 @@ impl Stream {
         Stream {
             player_config: config,
             session,
+            retries,
         }
     }
 
@@ -41,6 +43,7 @@ impl Stream {
         // primary track is available but has no files, so we have to resolve
         // region-restricted tracks ourselves.
         let primary_id = track.id.clone();
+        let retries = self.retries;
         let mut track_ids = vec![track.id.clone()];
         track_ids.extend(track.alternatives(&self.session).await);
 
@@ -53,7 +56,7 @@ impl Stream {
 
         tokio::spawn(async move {
             match tryhard::retry_fn(|| async { Self::load(player.clone(), &track_ids).await })
-                .retries(3)
+                .retries(retries)
                 .on_retry(|attempt, _, e| {
                     let error = format!("{}", e);
                     let tx = tx.clone();
@@ -67,7 +70,7 @@ impl Stream {
                         );
                         Self::send_event(&tx, StreamEvent::Retry {
                             attempt: attempt as usize,
-                            max_attempts: 3,
+                            max_attempts: retries as usize,
                         }).await;
                     }
                 })
