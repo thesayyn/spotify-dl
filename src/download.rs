@@ -31,10 +31,17 @@ pub struct DownloadOptions {
     pub parallel: usize,
     pub format: Format,
     pub force: bool,
+    pub retries: u32,
 }
 
 impl DownloadOptions {
-    pub fn new(destination: Option<String>, parallel: usize, format: Format, force: bool) -> Self {
+    pub fn new(
+        destination: Option<String>,
+        parallel: usize,
+        format: Format,
+        force: bool,
+        retries: u32,
+    ) -> Self {
         let destination =
             destination.map_or_else(|| std::env::current_dir().unwrap(), PathBuf::from);
         DownloadOptions {
@@ -42,6 +49,7 @@ impl DownloadOptions {
             parallel,
             format,
             force,
+            retries,
         }
     }
 }
@@ -70,7 +78,20 @@ impl Downloader {
 
     #[tracing::instrument(name = "download_track", skip(self))]
     async fn download_track(&self, track: Track, options: &DownloadOptions) -> Result<()> {
-        let metadata = track.metadata(&self.session).await?;
+        let metadata = match self.fetch_metadata(&track, options.retries).await {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                // A failed metadata fetch (transient network error or rate
+                // limiting) should only fail this track, not abort the whole
+                // batch. Without this, a single throttled request would
+                // short-circuit `try_collect` and kill every remaining
+                // download.
+                let name = format!("{:?}", track.id);
+                let pb = self.progress_bar.add(ProgressBar::new(0));
+                self.fail_with_error(&pb, &name, e.to_string());
+                return Ok(());
+            }
+        };
         tracing::info!("Downloading track: {:?}", metadata.track_name);
 
         let path = options
@@ -91,7 +112,7 @@ impl Downloader {
 
         let pb = self.add_progress_bar(&metadata);
 
-        let stream = Stream::new(self.session.clone());
+        let stream = Stream::new(self.session.clone(), options.retries);
         let channel = match stream.stream(track).await {
             Ok(channel) => channel,
             Err(e) => {
@@ -127,6 +148,32 @@ impl Downloader {
 
         pb.finish_with_message(format!("Downloaded {}", metadata.to_string()));
         Ok(())
+    }
+
+    /// Fetches track metadata, retrying on transient failures such as network
+    /// errors or rate limiting (HTTP 429). librespot already sleeps on short
+    /// `Retry-After` windows internally; this adds an outer backoff for longer
+    /// throttling so a single hiccup doesn't fail the track.
+    async fn fetch_metadata(&self, track: &Track, retries: u32) -> Result<TrackMetadata> {
+        let track_id = format!("{:?}", track.id);
+        tryhard::retry_fn(|| track.metadata(&self.session))
+            .retries(retries)
+            .on_retry(|attempt, _, e| {
+                let error = format!("{}", e);
+                let track_id = track_id.clone();
+                async move {
+                    tracing::warn!(
+                        "Retrying metadata fetch for {} (attempt {} of {}): {}",
+                        track_id,
+                        attempt,
+                        retries,
+                        error
+                    );
+                }
+            })
+            .exponential_backoff(Duration::from_secs(10))
+            .max_delay(Duration::from_secs(30))
+            .await
     }
 
     fn add_progress_bar(&self, track: &TrackMetadata) -> ProgressBar {

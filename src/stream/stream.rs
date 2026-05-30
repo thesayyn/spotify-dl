@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use librespot::core::Session;
+use librespot::core::SpotifyUri;
 use librespot::playback::config::{Bitrate, PlayerConfig};
 use librespot::playback::mixer::NoOpVolume;
 use librespot::playback::player::{Player, PlayerEvent};
@@ -15,10 +16,11 @@ use crate::track::Track;
 pub struct Stream {
     player_config: PlayerConfig,
     session: Session,
+    retries: u32,
 }
 
 impl Stream {
-    pub fn new(session: Session) -> Self {
+    pub fn new(session: Session, retries: u32) -> Self {
         let config = PlayerConfig {
             bitrate: Bitrate::Bitrate320,
             ..Default::default()
@@ -26,6 +28,7 @@ impl Stream {
         Stream {
             player_config: config,
             session,
+            retries,
         }
     }
 
@@ -33,6 +36,16 @@ impl Stream {
         let metadata = track.metadata(&self.session).await?;
         let (sink, mut channel) = ChannelSink::new(metadata);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Build the list of candidate ids to try, in order of preference: the
+        // requested track first, followed by any alternatives (regional
+        // re-releases). librespot only falls back to alternatives when the
+        // primary track is available but has no files, so we have to resolve
+        // region-restricted tracks ourselves.
+        let primary_id = track.id.clone();
+        let retries = self.retries;
+        let mut track_ids = vec![track.id.clone()];
+        track_ids.extend(track.alternatives(&self.session).await);
 
         let player = Player::new(
             self.player_config.clone(),
@@ -42,21 +55,22 @@ impl Stream {
         );
 
         tokio::spawn(async move {
-            match tryhard::retry_fn(|| async { Self::load(player.clone(), &track).await })
-                .retries(3)
+            match tryhard::retry_fn(|| async { Self::load(player.clone(), &track_ids).await })
+                .retries(retries)
                 .on_retry(|attempt, _, e| {
                     let error = format!("{}", e);
                     let tx = tx.clone();
+                    let id = primary_id.clone();
                     async move {
                         tracing::warn!(
                             "Attempt {} to load track {:?} failed: {}",
                             attempt,
-                            track.id,
+                            id,
                             error
                         );
                         Self::send_event(&tx, StreamEvent::Retry {
                             attempt: attempt as usize,
-                            max_attempts: 3,
+                            max_attempts: retries as usize,
                         }).await;
                     }
                 })
@@ -64,14 +78,14 @@ impl Stream {
                 .max_delay(Duration::from_secs(30))
                 .await
             {
-                Ok(_) => tracing::info!("Track loaded successfully: {:?}", track.id),
+                Ok(_) => tracing::info!("Track loaded successfully: {:?}", primary_id),
                 Err(e) => {
-                    tracing::error!("Failed to load track: {:?}, error: {:?}", track.id, e);
+                    tracing::error!("Failed to load track: {:?}, error: {:?}", primary_id, e);
                     Self::send_event(
                         &tx,
                         StreamEvent::Error(StreamError::LoadError(format!(
                             "Failed to load track: {:?}",
-                            track.id
+                            primary_id
                         ))),
                     )
                     .await;
@@ -79,7 +93,7 @@ impl Stream {
                 }
             }
 
-            tracing::info!("Streaming track: {:?}", track.id);
+            tracing::info!("Streaming track: {:?}", primary_id);
 
             while let Some(event) = channel.recv().await {
                 match event {
@@ -109,21 +123,51 @@ impl Stream {
         Ok(rx)
     }
 
-    async fn load(player: Arc<Player>, track: &Track) -> Result<()> {
-        player.load(track.id, true, 0);
+    async fn load(player: Arc<Player>, track_ids: &[SpotifyUri]) -> Result<()> {
+        let last = track_ids.len().saturating_sub(1);
+        for (index, id) in track_ids.iter().enumerate() {
+            match Self::load_id(player.clone(), id.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if index < last {
+                        tracing::warn!(
+                            "Track {:?} is unavailable, trying alternative {} of {}",
+                            id,
+                            index + 1,
+                            last
+                        );
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
 
-        tracing::info!("Loading track: {:?}", track.id);
+        Err(anyhow::anyhow!("No playable track found"))
+    }
+
+    async fn load_id(player: Arc<Player>, id: SpotifyUri) -> Result<()> {
+        let mut events = player.get_player_event_channel();
+        player.load(id.clone(), true, 0);
+
+        tracing::info!("Loading track: {:?}", id);
         loop {
-            match player.get_player_event_channel().recv().await {
+            match events.recv().await {
                 Some(PlayerEvent::Playing { .. })
                 | Some(PlayerEvent::TrackChanged { .. })
                 | Some(PlayerEvent::EndOfTrack { .. }) => {
-                    tracing::info!("Player started playing track: {:?}", track.id);
+                    tracing::info!("Player started playing track: {:?}", id);
                     break;
                 }
                 Some(PlayerEvent::Unavailable { .. }) => {
-                    tracing::info!("Track is unavailable: {:?}", track.id);
-                    return Err(anyhow::anyhow!("Could not load track: {:?}", track.id));
+                    tracing::info!("Track is unavailable: {:?}", id);
+                    return Err(anyhow::anyhow!("Could not load track: {:?}", id));
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "Player event channel closed while loading track: {:?}",
+                        id
+                    ));
                 }
                 _ => {
                     // Ignore other events
